@@ -20,7 +20,7 @@
 
 namespace BACKWARD
 {
-	void render(
+	void renderFisher(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
@@ -35,9 +35,8 @@ namespace BACKWARD
 		float3* dL_dmean2D,
 		float4* dL_dconic2D,
 		float* dL_dopacity,
-		float* dL_dcolors);
-
-	void preprocess(
+		float* dL_dcolors,
+    // Add preprocess info to get pixel-wise gradients
 		int P, int D, int M,
 		const float3* means,
 		const int* radii,
@@ -52,14 +51,15 @@ namespace BACKWARD
 		const float focal_x, float focal_y,
 		const float tan_fovx, float tan_fovy,
 		const glm::vec3* campos,
-		const float3* dL_dmean2D,
 		const float* dL_dconics,
 		glm::vec3* dL_dmeans,
 		float* dL_dcolor,
 		float* dL_dcov3D,
 		float* dL_dsh,
 		glm::vec3* dL_dscale,
-		glm::vec4* dL_drot);
+		glm::vec4* dL_drot,
+    float* fisher
+    );
 }
 
 #endif

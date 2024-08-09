@@ -141,7 +141,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 // Backward version of INVERSE 2D covariance matrix computation
 // (due to length launched as separate kernel before other 
 // backward steps contained in preprocess)
-__global__ void computeCov2DCUDA(int P,
+__device__ void computeCov2DCUDA(int P,
 	const float3* means,
 	const int* radii,
 	const float* cov3Ds,
@@ -152,7 +152,9 @@ __global__ void computeCov2DCUDA(int P,
 	float3* dL_dmeans,
 	float* dL_dcov)
 {
-	auto idx = cg::this_grid().thread_rank();
+	//auto idx = cg::this_grid().thread_rank();
+  //FisherRF hack
+  int idx = 0;
 	if (idx >= P || !(radii[idx] > 0))
 		return;
 
@@ -344,7 +346,7 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 // for the covariance computation and inversion
 // (those are handled by a previous kernel call)
 template<int C>
-__global__ void preprocessCUDA(
+__device__ void preprocessCUDA(
 	int P, int D, int M,
 	const float3* means,
 	const int* radii,
@@ -363,7 +365,8 @@ __global__ void preprocessCUDA(
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot)
 {
-	auto idx = cg::this_grid().thread_rank();
+	//auto idx = cg::this_grid().thread_rank();
+  int idx = 0;
 	if (idx >= P || !(radii[idx] > 0))
 		return;
 
@@ -395,10 +398,14 @@ __global__ void preprocessCUDA(
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
 }
 
-// Backward version of the rendering procedure.
+// Backward PUP 3D-GS Fisher computation. This is a modification of the 3D-GS
+// backward version of the rendering procedure. Our code borrows heavily from 
+// the FisherRF (https://jiangwenpl.github.io/FisherRF/) update to the CUDA
+// kernel. Please consider citing both 3D-GS and FisherRF if you find our
+// implementation useful in your work!
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
-renderCUDA(
+renderFisherCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
@@ -412,7 +419,30 @@ renderCUDA(
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+  // Other params
+	int P, int D, int M,
+	const float3* means3D,
+	const int* radii,
+	const float* shs,
+	const bool* clamped,
+	const glm::vec3* scales,
+	const glm::vec4* rotations,
+	const float scale_modifier,
+  const float* cov3Ds,
+  const float* viewmatrix,
+	const float* projmatrix,
+  const float focal_x, const float focal_y,
+  const float tan_fovx, const float tan_fovy,
+	const glm::vec3* campos,
+	const float* dL_dconic,
+	glm::vec3* dL_dmeans3D,
+	float* dL_dcolor,
+	float* dL_dcov3D,
+	float* dL_dsh,
+	glm::vec3* dL_dscale,
+	glm::vec4* dL_drot,
+  float* fisher)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -452,7 +482,7 @@ renderCUDA(
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
 
-	float last_alpha = 0;
+	float last_alpha[C] = { 0 };
 	float last_color[C] = { 0 };
 
 	// Gradient of pixel coordinate w.r.t. normalized 
@@ -503,125 +533,160 @@ renderCUDA(
 			T = T / (1.f - alpha);
 			const float dchannel_dcolor = alpha * T;
 
+      // We use the FisherRF code here. Specifically, we use their
+      // implementation to compute per pixel mean and scaling gradients.
+      // For the FisherRF backward implementation see:
+      // https://github.com/JiangWenPL/FisherRF/blob/main/diff/cuda_rasterizer/backward.cu
+
+      glm::vec3 cur_dL_dcolors(0.0f, 0.0f, 0.0f);
+      glm::vec3 cur_dL_dmean2D(0.0f, 0.0f, 0.0f);
+      float4 cur_dL_dconic2D = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float cur_dL_dopacity = 0.0f;
+
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).
-			float dL_dalpha = 0.0f;
+			float dL_dalpha[C] = { 0 };
 			const int global_id = collected_id[j];
 			for (int ch = 0; ch < C; ch++)
 			{
 				const float c = collected_colors[ch * BLOCK_SIZE + j];
 				// Update last color (to be used in the next iteration)
-				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+				accum_rec[ch] = last_alpha[ch] * last_color[ch] + (1.f - last_alpha[ch]) * accum_rec[ch];
 				last_color[ch] = c;
 
 				const float dL_dchannel = dL_dpixel[ch];
-				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+				dL_dalpha[ch] = (c - accum_rec[ch]) * dL_dchannel;
 				// Update the gradients w.r.t. color of the Gaussian. 
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
-			}
-			dL_dalpha *= T;
-			// Update last alpha (to be used in the next iteration)
-			last_alpha = alpha;
+				//atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+        cur_dL_dcolors[ch] = dchannel_dcolor * dL_dchannel;
+
+        dL_dalpha[ch] *= T;
+        // Update last alpha (to be used in the next iteration)
+        last_alpha[ch] = alpha;
 
 			// Account for fact that alpha also influences how much of
 			// the background color is added if nothing left to blend
-			float bg_dot_dpixel = 0;
-			for (int i = 0; i < C; i++)
-				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+        float bg_dot_dpixel = 0;
+				bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
+        dL_dalpha[ch] += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
-			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+        // Helpful reusable temporary variables
+        const float dL_dG = con_o.w * dL_dalpha[ch];
+        const float gdx = G * d.x;
+        const float gdy = G * d.y;
+        const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+        const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+        // Update gradients w.r.t. 2D mean position of the Gaussian
+        //atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+        //atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+        // Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+        //atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+        //atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+        //atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
 
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+        // Update gradients w.r.t. opacity of the Gaussian
+        //atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+
+        cur_dL_dmean2D.x = dL_dG * dG_ddelx * ddelx_dx;
+        cur_dL_dmean2D.y = dL_dG * dG_ddely * ddely_dy;
+
+        cur_dL_dconic2D.x = -0.5f * gdx * d.x * dL_dG;
+        cur_dL_dconic2D.y = -0.5f * gdx * d.y * dL_dG;
+        cur_dL_dconic2D.w = -0.5f * gdy * d.y * dL_dG;
+        cur_dL_dopacity = G * dL_dalpha[ch];
+
+        if (global_id >= P)
+            continue;
+
+        float3 cur_dL_dmeans = make_float3(0.0f, 0.0f, 0.0f);
+        float cur_dL_dcov3D[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        computeCov2DCUDA(P,
+          &means3D[global_id],
+          &radii[global_id],
+          cov3Ds + 6 * global_id,
+          focal_x,
+          focal_y,
+          tan_fovx,
+          tan_fovy,
+          viewmatrix,
+          (const float*)&cur_dL_dconic2D,
+          &cur_dL_dmeans,
+          (float*)cur_dL_dcov3D);
+
+        const int MAX_SH_CHANNELS = 16;
+        float3 cur_dL_dshs[MAX_SH_CHANNELS];
+        memset(cur_dL_dshs, 0,  sizeof(float3) * MAX_SH_CHANNELS);
+
+        glm::vec3 cur_dL_dscale(0.0f, 0.0f, 0.0f);
+        glm::vec4 cur_dL_drot(0.0f, 0.0f, 0.0f, 0.0f);
+
+        preprocessCUDA<NUM_CHANNELS>(
+          P, D, M,
+          &means3D[global_id],
+          &radii[global_id],
+          &shs[3 * M * global_id],
+          &clamped[3 * global_id],
+          &scales[global_id],
+          &rotations[global_id],
+          scale_modifier,
+          projmatrix,
+          campos,
+          (const float3*)&cur_dL_dmean2D,
+          (glm::vec3*)&cur_dL_dmeans,
+          (float*)&cur_dL_dcolors,
+          (float*)cur_dL_dcov3D,
+          (float*)cur_dL_dshs,
+          &cur_dL_dscale,
+          &cur_dL_drot
+        );
+
+        // Start PUP 3D-GS Fisher
+
+        // Our scaling INCLUDES the scaling activation, i.e., torch.exp, so
+        // updating cur_dL_dscale to include this:
+        cur_dL_dscale.x *= scales[global_id].x;
+        cur_dL_dscale.y *= scales[global_id].y;
+        cur_dL_dscale.z *= scales[global_id].z;
+
+        atomicAdd(&(fisher[21 * global_id + 0 ]), cur_dL_dmeans.x * cur_dL_dmeans.x);
+        atomicAdd(&(fisher[21 * global_id + 1 ]), cur_dL_dmeans.x * cur_dL_dmeans.y);
+        atomicAdd(&(fisher[21 * global_id + 2 ]), cur_dL_dmeans.x * cur_dL_dmeans.z);
+        atomicAdd(&(fisher[21 * global_id + 3 ]), cur_dL_dmeans.x * cur_dL_dscale.x);
+        atomicAdd(&(fisher[21 * global_id + 4 ]), cur_dL_dmeans.x * cur_dL_dscale.y);
+        atomicAdd(&(fisher[21 * global_id + 5 ]), cur_dL_dmeans.x * cur_dL_dscale.z);
+
+        atomicAdd(&(fisher[21 * global_id + 6 ]), cur_dL_dmeans.y * cur_dL_dmeans.y);
+        atomicAdd(&(fisher[21 * global_id + 7 ]), cur_dL_dmeans.y * cur_dL_dmeans.z);
+        atomicAdd(&(fisher[21 * global_id + 8 ]), cur_dL_dmeans.y * cur_dL_dscale.x);
+        atomicAdd(&(fisher[21 * global_id + 9 ]), cur_dL_dmeans.y * cur_dL_dscale.y);
+        atomicAdd(&(fisher[21 * global_id + 10]), cur_dL_dmeans.y * cur_dL_dscale.z);
+
+        atomicAdd(&(fisher[21 * global_id + 11]), cur_dL_dmeans.z * cur_dL_dmeans.z);
+        atomicAdd(&(fisher[21 * global_id + 12]), cur_dL_dmeans.z * cur_dL_dscale.x);
+        atomicAdd(&(fisher[21 * global_id + 13]), cur_dL_dmeans.z * cur_dL_dscale.y);
+        atomicAdd(&(fisher[21 * global_id + 14]), cur_dL_dmeans.z * cur_dL_dscale.z);
+
+        atomicAdd(&(fisher[21 * global_id + 15]), cur_dL_dscale.x * cur_dL_dscale.x);
+        atomicAdd(&(fisher[21 * global_id + 16]), cur_dL_dscale.x * cur_dL_dscale.y);
+        atomicAdd(&(fisher[21 * global_id + 17]), cur_dL_dscale.x * cur_dL_dscale.z);
+
+        atomicAdd(&(fisher[21 * global_id + 18]), cur_dL_dscale.y * cur_dL_dscale.y);
+        atomicAdd(&(fisher[21 * global_id + 19]), cur_dL_dscale.y * cur_dL_dscale.z);
+
+        atomicAdd(&(fisher[21 * global_id + 20]), cur_dL_dscale.z * cur_dL_dscale.z);
+      }
+
 		}
 	}
 }
 
-void BACKWARD::preprocess(
-	int P, int D, int M,
-	const float3* means3D,
-	const int* radii,
-	const float* shs,
-	const bool* clamped,
-	const glm::vec3* scales,
-	const glm::vec4* rotations,
-	const float scale_modifier,
-	const float* cov3Ds,
-	const float* viewmatrix,
-	const float* projmatrix,
-	const float focal_x, float focal_y,
-	const float tan_fovx, float tan_fovy,
-	const glm::vec3* campos,
-	const float3* dL_dmean2D,
-	const float* dL_dconic,
-	glm::vec3* dL_dmean3D,
-	float* dL_dcolor,
-	float* dL_dcov3D,
-	float* dL_dsh,
-	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
-{
-	// Propagate gradients for the path of 2D conic matrix computation. 
-	// Somewhat long, thus it is its own kernel rather than being part of 
-	// "preprocess". When done, loss gradient w.r.t. 3D means has been
-	// modified and gradient w.r.t. 3D covariance matrix has been computed.	
-	computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
-		P,
-		means3D,
-		radii,
-		cov3Ds,
-		focal_x,
-		focal_y,
-		tan_fovx,
-		tan_fovy,
-		viewmatrix,
-		dL_dconic,
-		(float3*)dL_dmean3D,
-		dL_dcov3D);
-
-	// Propagate gradients for remaining steps: finish 3D mean gradients,
-	// propagate color gradients to SH (if desireD), propagate 3D covariance
-	// matrix gradients to scale and rotation.
-	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256 >> > (
-		P, D, M,
-		(float3*)means3D,
-		radii,
-		shs,
-		clamped,
-		(glm::vec3*)scales,
-		(glm::vec4*)rotations,
-		scale_modifier,
-		projmatrix,
-		campos,
-		(float3*)dL_dmean2D,
-		(glm::vec3*)dL_dmean3D,
-		dL_dcolor,
-		dL_dcov3D,
-		dL_dsh,
-		dL_dscale,
-		dL_drot);
-}
-
-void BACKWARD::render(
+void BACKWARD::renderFisher(
 	const dim3 grid, const dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
@@ -636,9 +701,33 @@ void BACKWARD::render(
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+  // Add preprocess info to get pixel-wise gradients
+	int P, int D, int M,
+	const float3* means3D,
+	const int* radii,
+	const float* shs,
+	const bool* clamped,
+	const glm::vec3* scales,
+	const glm::vec4* rotations,
+	const float scale_modifier,
+	const float* cov3Ds,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float focal_x, const float focal_y,
+	const float tan_fovx, const float tan_fovy,
+	const glm::vec3* campos,
+	const float* dL_dconic,
+	glm::vec3* dL_dmean3D,
+	float* dL_dcolor,
+	float* dL_dcov3D,
+	float* dL_dsh,
+	glm::vec3* dL_dscale,
+	glm::vec4* dL_drot,
+	float* fisher
+  )
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	renderFisherCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
@@ -652,6 +741,29 @@ void BACKWARD::render(
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
-		);
+		dL_dcolors,
+    // Add preprocess info to get pixel-wise gradients
+		P, D, M,
+		(float3*)means3D,
+		radii,
+		shs,
+		clamped,
+		(glm::vec3*)scales,
+		(glm::vec4*)rotations,
+		scale_modifier,
+    cov3Ds,
+    viewmatrix,
+		projmatrix,
+    focal_x, focal_y,
+    tan_fovx, tan_fovy,
+		(glm::vec3*)campos,
+    dL_dconic,
+		(glm::vec3*)dL_dmean3D,
+		dL_dcolor,
+		dL_dcov3D,
+		dL_dsh,
+		(glm::vec3*)dL_dscale,
+		(glm::vec4*)dL_drot,
+    fisher);
+
 }
