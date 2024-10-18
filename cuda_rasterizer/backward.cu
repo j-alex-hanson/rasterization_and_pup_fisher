@@ -654,6 +654,10 @@ renderFisherCUDA(
         cur_dL_dscale.y *= scales[global_id].y;
         cur_dL_dscale.z *= scales[global_id].z;
 
+        // This ensures backprop through SHs only updates mean gradient
+        // for the current color channel.
+        cur_dL_dcolors[ch] = 0.0f;
+
         atomicAdd(&(fisher[21 * global_id + 0 ]), cur_dL_dmeans.x * cur_dL_dmeans.x);
         atomicAdd(&(fisher[21 * global_id + 1 ]), cur_dL_dmeans.x * cur_dL_dmeans.y);
         atomicAdd(&(fisher[21 * global_id + 2 ]), cur_dL_dmeans.x * cur_dL_dmeans.z);
